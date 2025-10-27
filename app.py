@@ -3,35 +3,42 @@ from instagrapi import Client
 import threading
 import time
 import os
+import json
 
 app = Flask(__name__)
-UPLOAD_FOLDER = "uploads"
+
+# Render-compatible upload directory
+UPLOAD_FOLDER = "/tmp/uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
-# Global variables
+# Global variables (basic state tracking)
 messages = []
 interval = 0
 thread_id = ""
 prefix = ""
 cl = None
 running = False
+lock = threading.Lock()  # To prevent race conditions
 
+
+# Function to send messages continuously
 def send_messages():
     global messages, interval, thread_id, prefix, cl, running
     for message in messages:
-        if not running:
-            break
+        with lock:
+            if not running:
+                break
         try:
             full_message = f"{prefix} {message}" if prefix else message
-            cl.direct_send(full_message, thread_ids=[thread_id])
+            cl.direct_send(full_message, [thread_id])
             print(f"Message sent: {full_message}")
-            time.sleep(interval)
         except Exception as e:
-            print(f"Error: {e}")
-            time.sleep(interval)
+            print(f"Error while sending message: {e}")
+        time.sleep(interval)
 
-# HTML template with design and cookies.txt upload
+
+# HTML UI Template
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -201,55 +208,63 @@ HTML_TEMPLATE = """
         <form method="POST" action="/stop">
             <button type="submit" class="stop">Stop Sending</button>
         </form>
-        <p>{{ status }}</p>
+        <p>{{ status | safe }}</p>
     </div>
 </body>
 </html>
 """
 
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     global messages, interval, thread_id, prefix, cl, running
     status = "Enter details to start sending messages."
-    
+
     if request.method == "POST":
-        # Get form data
-        thread_id = request.form["thread_id"]
-        interval = int(request.form["interval"])
-        prefix = request.form["prefix"]
-        
-        # Handle cookies file
-        if "cookies_file" not in request.files or not request.files["cookies_file"].filename:
-            return render_template_string(HTML_TEMPLATE, status="Please upload cookies.txt")
-        cookies_file = request.files["cookies_file"]
-        cookies_path = os.path.join(app.config["UPLOAD_FOLDER"], "cookies.txt")
-        cookies_file.save(cookies_path)
-        
-        # Load messages from textarea
-        messages = [msg.strip() for msg in request.form["messages"].split("\n") if msg.strip()]
-        
-        # Login with cookies
         try:
-            cl = Client()
+            thread_id = request.form["thread_id"].strip()
+            interval = int(request.form["interval"])
+            prefix = request.form.get("prefix", "").strip()
+
+            # Handle cookies file upload
+            cookies_file = request.files.get("cookies_file")
+            if not cookies_file or cookies_file.filename == "":
+                return render_template_string(HTML_TEMPLATE, status="Please upload cookies.txt")
+
+            cookies_path = os.path.join(app.config["UPLOAD_FOLDER"], "cookies.txt")
+            cookies_file.save(cookies_path)
+
+            # Load cookies safely (JSON format)
             with open(cookies_path, "r") as f:
-                cookies = eval(f.read())
-            cl.load_settings_dict({"sessionid": cookies.get("sessionid")})
+                cookies = json.load(f)
+
+            # Initialize Instagram client
+            cl = Client()
             cl.login_by_sessionid(cookies["sessionid"])
-            running = True
+
+            # Load and clean messages
+            messages = [m.strip() for m in request.form["messages"].split("\n") if m.strip()]
+
+            # Start sending in background
+            with lock:
+                running = True
             threading.Thread(target=send_messages, daemon=True).start()
-            status = "Messages are being sent!"
+
+            status = "✅ Messages are being sent!"
         except Exception as e:
-            status = f"Error: {e}"
-    
+            status = f"❌ Error: {str(e)}"
+
     return render_template_string(HTML_TEMPLATE, status=status)
+
 
 @app.route("/stop", methods=["POST"])
 def stop():
     global running
-    running = False
-    return render_template_string(HTML_TEMPLATE, status="Stopped sending messages.")
+    with lock:
+        running = False
+    return render_template_string(HTML_TEMPLATE, status="🛑 Stopped sending messages.")
+
 
 if __name__ == "__main__":
-    # Get port from environment variable or default to 5000
-    port = int(os.getenv("PORT", 5000))  # Change PORT via environment variable, e.g., export PORT=8080
+    port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
